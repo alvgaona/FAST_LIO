@@ -56,6 +56,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
@@ -88,6 +89,13 @@ string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
+double drift_time_origin = 0.0;
+double drift_old_residual_sum = 0.0, drift_new_residual_sum = 0.0;
+int drift_old_count = 0, drift_new_count = 0;
+constexpr float DRIFT_AGE_THRESHOLD = 5.0f;
+Eigen::Matrix<double, 6, 1> degen_eigenvalues = Eigen::Matrix<double, 6, 1>::Zero();
+Eigen::Matrix<double, 6, 6> degen_eigenvectors = Eigen::Matrix<double, 6, 6>::Zero();
+double degen_condition_number = 1.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
@@ -462,6 +470,11 @@ void map_incremental()
         }
     }
 
+    if (drift_time_origin == 0.0) drift_time_origin = lidar_end_time;
+    float rel_time = static_cast<float>(lidar_end_time - drift_time_origin);
+    for (auto& p : PointToAdd) p.curvature = rel_time;
+    for (auto& p : PointNoNeedDownsample) p.curvature = rel_time;
+
     double st_time = omp_get_wtime();
     add_point_size = ikdtree.Add_Points(PointToAdd, true);
     ikdtree.Add_Points(PointNoNeedDownsample, false); 
@@ -689,6 +702,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     
     effct_feat_num = 0;
 
+    float current_rel_time = static_cast<float>(lidar_end_time - drift_time_origin);
     for (int i = 0; i < feats_down_size; i++)
     {
         if (point_selected_surf[i])
@@ -697,6 +711,15 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             corr_normvect->points[effct_feat_num] = normvec->points[i];
             total_residual += res_last[i];
             effct_feat_num ++;
+
+            float point_age = current_rel_time - Nearest_Points[i][0].curvature;
+            if (point_age > DRIFT_AGE_THRESHOLD) {
+                drift_old_residual_sum += res_last[i];
+                drift_old_count++;
+            } else {
+                drift_new_residual_sum += res_last[i];
+                drift_new_count++;
+            }
         }
     }
 
@@ -746,6 +769,13 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+    Eigen::Matrix<double, 6, 6> FIM_pose =
+        ekfom_data.h_x.leftCols<6>().transpose() * ekfom_data.h_x.leftCols<6>();
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(FIM_pose);
+    degen_eigenvalues = solver.eigenvalues();
+    degen_eigenvectors = solver.eigenvectors();
+    degen_condition_number = degen_eigenvalues(5) / std::max(degen_eigenvalues(0), 1e-10);
+
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -921,6 +951,8 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubDriftIndicator_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/drift_indicator", 10);
+        pubDegeneracy_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/degeneracy", 10);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -1067,7 +1099,36 @@ private:
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
-            
+
+            {
+                std_msgs::msg::Float64MultiArray drift_msg;
+                drift_msg.data.resize(5);
+                drift_msg.data[0] = drift_old_count > 0
+                    ? drift_old_residual_sum / drift_old_count : 0.0;
+                drift_msg.data[1] = drift_new_count > 0
+                    ? drift_new_residual_sum / drift_new_count : 0.0;
+                drift_msg.data[2] = (drift_new_count > 0 && drift_old_count > 0)
+                    ? (drift_old_residual_sum / drift_old_count)
+                      / (drift_new_residual_sum / drift_new_count)
+                    : 1.0;
+                drift_msg.data[3] = static_cast<double>(drift_old_count);
+                drift_msg.data[4] = static_cast<double>(drift_new_count);
+                pubDriftIndicator_->publish(drift_msg);
+                drift_old_residual_sum = drift_new_residual_sum = 0.0;
+                drift_old_count = drift_new_count = 0;
+            }
+
+            {
+                std_msgs::msg::Float64MultiArray degen_msg;
+                degen_msg.data.resize(13);
+                for (int i = 0; i < 6; i++)
+                    degen_msg.data[i] = degen_eigenvalues(i);
+                degen_msg.data[6] = degen_condition_number;
+                for (int i = 0; i < 6; i++)
+                    degen_msg.data[7 + i] = degen_eigenvectors(i, 0);
+                pubDegeneracy_->publish(degen_msg);
+            }
+
             /******* Publish points *******/
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
@@ -1271,6 +1332,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubDriftIndicator_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubDegeneracy_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
